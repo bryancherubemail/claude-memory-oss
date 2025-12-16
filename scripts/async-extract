@@ -1,0 +1,33 @@
+#!/bin/bash
+# Async wrapper for auto_learn.py
+# Runs extraction in background so hooks complete quickly
+
+SCRIPT_DIR="$(dirname "$(realpath "$0")")/.."
+LOG_FILE="${CLAUDE_MEMORY_DIR:-$HOME/.claude-memory}/logs/extraction.log"
+LOCK_FILE="${CLAUDE_MEMORY_DIR:-$HOME/.claude-memory}/locks/extraction.lock"
+
+MAX_TIME="${EXTRACTION_MAX_TIME:-120}"
+
+mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$LOCK_FILE")"
+
+# Skip if already running
+if [ -f "$LOCK_FILE" ]; then
+    PID=$(cat "$LOCK_FILE")
+    if kill -0 "$PID" 2>/dev/null; then
+        echo "Extraction already running (PID $PID)"
+        exit 0
+    fi
+    rm -f "$LOCK_FILE"
+fi
+
+# Run in background
+(
+    echo $$ > "$LOCK_FILE"
+    trap "rm -f '$LOCK_FILE'" EXIT
+
+    echo "=== $(date) ===" >> "$LOG_FILE"
+    python3 "$SCRIPT_DIR/src/claude_memory/auto_learn.py" --max-time "$MAX_TIME" "$@" >> "$LOG_FILE" 2>&1
+) &
+
+disown
+echo "Extraction started (max ${MAX_TIME}s)"

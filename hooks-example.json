@@ -1,0 +1,43 @@
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude-memory/scripts/async-extract --incremental",
+            "timeout": 5,
+            "statusMessage": "Extracting learnings..."
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude-memory/src/claude_memory/auto_learn.py --final",
+            "timeout": 30,
+            "statusMessage": "Final extraction..."
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude-memory/scripts/inject-session-state",
+            "timeout": 5,
+            "statusMessage": "Restoring context..."
+          }
+        ]
+      }
+    ]
+  }
+}

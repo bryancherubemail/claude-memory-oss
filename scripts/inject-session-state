@@ -1,0 +1,24 @@
+#!/bin/bash
+# Inject session state after compaction
+# Called by SessionStart hook when context was compacted
+
+SESSIONS_DIR="${CLAUDE_MEMORY_DIR:-$HOME/.claude-memory}/sessions"
+
+# Detect project
+if git rev-parse --git-dir > /dev/null 2>&1; then
+    PROJECT=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)")
+else
+    PROJECT=$(basename "$(pwd)")
+fi
+
+[ "$(pwd)" = "$HOME/Claude" ] && PROJECT="global"
+
+SESSION_FILE="$SESSIONS_DIR/$PROJECT.md"
+
+if [ -f "$SESSION_FILE" ]; then
+    echo "=== SESSION CONTEXT RESTORED ==="
+    echo ""
+    cat "$SESSION_FILE"
+    echo ""
+    echo "=== END SESSION CONTEXT ==="
+fi
