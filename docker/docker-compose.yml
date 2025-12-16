@@ -1,0 +1,28 @@
+services:
+  # Embedding service (sentence-transformers)
+  embeddings:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.2
+    container_name: claude-memory-embeddings
+    ports:
+      - "8080:80"
+    volumes:
+      - embeddings_cache:/data
+    command: --model-id sentence-transformers/all-MiniLM-L6-v2
+    restart: unless-stopped
+
+  # Vector database
+  chroma:
+    image: ghcr.io/chroma-core/chroma:latest
+    container_name: claude-memory-chroma
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    restart: unless-stopped
+
+volumes:
+  embeddings_cache:
+  chroma_data:
