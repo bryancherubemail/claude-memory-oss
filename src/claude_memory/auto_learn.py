@@ -4,6 +4,12 @@ Automatic Learning Extraction using Ollama
 
 Analyzes Claude's conversation logs and extracts learnings automatically.
 Triggered via Claude Code hooks (PreCompact, SessionEnd).
+
+Features:
+- Scope-aware learning extraction (project, global, language-specific)
+- Timeout tracking and queuing for interrupted extractions
+- Session state extraction for compaction recovery
+- Configurable LLM model via OLLAMA_MODEL env var
 """
 
 import hashlib
@@ -35,7 +41,7 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma3:4b")
 _start_time: Optional[float] = None
 _max_time: Optional[int] = None
 
-# Category mapping
+# Category mapping from LLM output prefixes to DB types
 CATEGORY_MAP = {
     "DECISION": "decisions",
     "CONVENTION": "conventions",
@@ -48,28 +54,48 @@ CATEGORY_MAP = {
     "FIX": "solutions",
 }
 
+# Scope mapping
+SCOPE_MAP = {
+    "GLOBAL": "global",
+    "PROJECT": "project",
+    "PYTHON": "language:python",
+    "JAVASCRIPT": "language:javascript",
+    "GO": "language:go",
+    "RUST": "language:rust",
+    "SQL": "language:sql",
+    "TYPESCRIPT": "language:javascript",
+}
+
 EXTRACTION_PROMPT = """You extract HIGH-VALUE technical learnings from development conversations.
 
-OUTPUT FORMAT - Each learning on its own line, starting with the category prefix:
-CATEGORY: learning content
+OUTPUT FORMAT - Each learning on its own line with this structure:
+CATEGORY|SCOPE|CONFIDENCE|learning content
 
 Categories: DECISION, CONVENTION, TECH_STACK, GOTCHA, SOLUTION
+Scopes: PROJECT (default), GLOBAL (applies everywhere), PYTHON, JAVASCRIPT, GO, RUST, SQL
+Confidence: HIGH (definitely valuable), MEDIUM (probably valuable), LOW (maybe valuable)
 
 RULES:
 - Maximum 5 learnings, only high-value items worth remembering months later
-- Include project name and specific details (versions, file paths, reasoning)
+- Include specific details (versions, file paths, error messages, reasoning)
+- Use GLOBAL scope for universal best practices (e.g., "always validate user input")
+- Use language scope for language-specific gotchas (e.g., Python asyncio issues)
+- Use PROJECT scope for project-specific decisions
+- ONLY output HIGH or MEDIUM confidence learnings
 - REJECT: obvious facts, generic advice, trivial commands
 - If nothing valuable, output "NONE"
 
 EXAMPLES:
-DECISION: Project uses PostgreSQL instead of MySQL for better JSON support
-GOTCHA: GORM .Find() without .Limit() causes memory exhaustion on large datasets
-CONVENTION: All API endpoints must validate input before processing
+DECISION|PROJECT|HIGH|Using PostgreSQL over MySQL for native JSON column support in user preferences
+GOTCHA|PYTHON|HIGH|asyncio.gather() silently swallows exceptions without return_exceptions=True parameter
+CONVENTION|PROJECT|MEDIUM|API endpoints use kebab-case URLs with camelCase JSON response keys
+SOLUTION|GLOBAL|HIGH|Fixed CORS preflight by ensuring OPTIONS handler returns 204, not 200 with body
+GOTCHA|GO|HIGH|GORM .Find() without .Limit() loads entire table into memory - always paginate
 
 CONVERSATION:
 {conversation_text}
 
-Output learnings (one per line, starting with category):"""
+Output learnings (one per line, CATEGORY|SCOPE|CONFIDENCE|content):"""
 
 SESSION_STATE_PROMPT = """Summarize the current working state for context preservation after memory compaction.
 
@@ -180,37 +206,71 @@ def call_ollama(prompt: str, timeout: int = 60) -> str:
         return ""
 
 
-def parse_llm_output(output: str) -> Dict[str, List[str]]:
-    """Parse LLM output into categorized learnings."""
-    learnings = {cat: [] for cat in ["decisions", "conventions", "tech_stack", "gotchas", "solutions"]}
+def parse_llm_output(output: str) -> List[Dict]:
+    """Parse LLM output into structured learnings with category, scope, and confidence."""
+    learnings = []
 
     if not output or output.upper().strip() == "NONE":
         return learnings
 
     for line in output.split('\n'):
-        line = line.strip().lstrip('-•* ').strip()
+        line = line.strip().lstrip('-* ').strip()
         if not line or len(line) < 20:
             continue
 
+        # Try new format: CATEGORY|SCOPE|CONFIDENCE|content
+        parts = line.split('|', 3)
+        if len(parts) == 4:
+            cat_raw, scope_raw, conf_raw, content = parts
+            cat_raw = cat_raw.strip().upper()
+            scope_raw = scope_raw.strip().upper()
+            conf_raw = conf_raw.strip().upper()
+            content = content.strip()
+
+            category = CATEGORY_MAP.get(cat_raw)
+            if not category:
+                continue
+
+            scope = SCOPE_MAP.get(scope_raw, "project")
+
+            # Filter by confidence (only HIGH and MEDIUM)
+            if conf_raw not in ("HIGH", "MEDIUM"):
+                continue
+
+            if len(content) >= 20:
+                learnings.append({
+                    "category": category,
+                    "scope": scope,
+                    "confidence": conf_raw.lower(),
+                    "content": content,
+                })
+            continue
+
+        # Fallback: old format CATEGORY: content
         for prefix, category in CATEGORY_MAP.items():
             if line.startswith(f"{prefix}:"):
                 content = line[len(prefix)+1:].strip()
                 if len(content) >= 20:
-                    learnings[category].append(content)
+                    learnings.append({
+                        "category": category,
+                        "scope": "project",
+                        "confidence": "medium",
+                        "content": content,
+                    })
                 break
 
     return learnings
 
 
-def store_learning(content: str, category: str, project: str, context: str = "") -> bool:
-    """Store a learning in SQLite."""
+def store_learning(content: str, category: str, project: str, context: str = "", scope: str = "project") -> bool:
+    """Store a learning in SQLite with scope support."""
     try:
         MEMORY_DB.parent.mkdir(parents=True, exist_ok=True)
 
         conn = sqlite3.connect(MEMORY_DB, timeout=10.0)
         cursor = conn.cursor()
 
-        # Ensure table exists
+        # Ensure table exists with scope column
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY,
@@ -219,15 +279,18 @@ def store_learning(content: str, category: str, project: str, context: str = "")
                 content TEXT NOT NULL,
                 context TEXT,
                 relevance_score REAL DEFAULT 1.0,
-                project TEXT DEFAULT 'global'
+                project TEXT DEFAULT 'global',
+                scope TEXT DEFAULT 'project',
+                access_count INTEGER DEFAULT 0
             )
         """)
 
         memory_id = hashlib.md5(f"{content}{datetime.now().isoformat()}".encode()).hexdigest()
 
         cursor.execute(
-            "INSERT INTO memories (id, timestamp, type, content, context, relevance_score, project) VALUES (?, ?, ?, ?, ?, 1.0, ?)",
-            (memory_id, datetime.now().isoformat(), category, content, context, project)
+            """INSERT INTO memories (id, timestamp, type, content, context, relevance_score, project, scope, access_count)
+               VALUES (?, ?, ?, ?, ?, 1.0, ?, ?, 0)""",
+            (memory_id, datetime.now().isoformat(), category, content, context, project, scope)
         )
 
         conn.commit()
@@ -425,12 +488,18 @@ def process_session(incremental: bool = False, final: bool = False):
 
         if output:
             learnings = parse_llm_output(output)
-            for category, items in learnings.items():
-                for learning in items:
-                    context = f"Auto-extracted via {OLLAMA_MODEL}"
-                    if store_learning(learning, category, project, context):
-                        total_learnings += 1
-                        print(f"  + {category}: {learning[:60]}...", file=sys.stderr)
+            for learning in learnings:
+                category = learning["category"]
+                content = learning["content"]
+                scope = learning["scope"]
+                confidence = learning.get("confidence", "medium")
+
+                context = f"Auto-extracted via {OLLAMA_MODEL} (confidence: {confidence})"
+
+                if store_learning(content, category, project, context, scope):
+                    total_learnings += 1
+                    scope_label = f"[{scope}]" if scope != "project" else ""
+                    print(f"  + {category} {scope_label}: {content[:60]}...", file=sys.stderr)
 
         for msg in batch:
             if msg.get("_msg_id"):
@@ -485,9 +554,15 @@ def process_queue():
                 output = call_ollama(prompt)
 
                 if output:
-                    for category, items in parse_llm_output(output).items():
-                        for learning in items:
-                            store_learning(learning, category, project, "From queue")
+                    learnings = parse_llm_output(output)
+                    for learning in learnings:
+                        store_learning(
+                            learning["content"],
+                            learning["category"],
+                            project,
+                            "From queue",
+                            learning["scope"]
+                        )
 
         QUEUE_FILE.unlink()
         print("Queue processed", file=sys.stderr)

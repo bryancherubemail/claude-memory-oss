@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""
+Claude Memory CLI - Unified memory management tool
+
+Usage:
+    mem search <query>       Search memories
+    mem stats                Show statistics
+    mem recent [days]        Show recent memories
+    mem consolidate [--apply] Find and remove duplicates
+    mem prune [--days N]     Remove old low-access memories
+    mem export [file]        Export memories to JSON
+    mem scope-fix [--apply]  Auto-detect and fix scope for existing memories
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import sqlite3
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import httpx
+
+# Configuration
+DATA_DIR = Path(os.environ.get("CLAUDE_MEMORY_DIR", Path.home() / ".claude-memory"))
+MEMORY_DB = DATA_DIR / "data" / "memory.db"
+CHROMA_URL = os.environ.get("CHROMA_URL", "http://localhost:8000")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text:latest")
+COLLECTION_NAME = "claude_memories"
+CHROMA_API_BASE = f"{CHROMA_URL}/api/v2/tenants/default_tenant/databases/default_database/collections"
+
+# Language detection patterns
+LANGUAGE_PATTERNS = {
+    "python": [".py", "django", "flask", "fastapi", "asyncio", "pip", "pytest", "python"],
+    "javascript": [".js", ".ts", "node", "npm", "react", "vue", "next", "javascript", "typescript"],
+    "go": [".go", "golang", "goroutine", "gorm"],
+    "rust": [".rs", "cargo", "tokio", "rust"],
+    "sql": ["postgres", "mysql", "sqlite", "database", "query", "sql"],
+}
+
+
+def get_db():
+    conn = sqlite3.connect(MEMORY_DB, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def detect_language(content: str) -> str:
+    """Detect programming language from content."""
+    content_lower = content.lower()
+    for lang, patterns in LANGUAGE_PATTERNS.items():
+        if any(p in content_lower for p in patterns):
+            return f"language:{lang}"
+    return "project"
+
+
+def cmd_search(args):
+    """Search memories."""
+    conn = get_db()
+    cursor = conn.cursor()
+
+    query = args.query
+    limit = args.limit
+
+    cursor.execute("""
+        SELECT id, content, type, timestamp, project, scope, access_count
+        FROM memories
+        WHERE content LIKE ? OR context LIKE ?
+        ORDER BY access_count DESC, timestamp DESC
+        LIMIT ?
+    """, (f"%{query}%", f"%{query}%", limit))
+
+    results = cursor.fetchall()
+    conn.close()
+
+    if not results:
+        print(f"No memories found matching: {query}")
+        return
+
+    print(f"\n{'='*60}")
+    print(f"Search Results: '{query}' ({len(results)} found)")
+    print(f"{'='*60}\n")
+
+    for i, row in enumerate(results, 1):
+        scope = row["scope"] or "project"
+        access = row["access_count"] or 0
+        print(f"{i}. [{row['type']}] {scope}")
+        print(f"   Project: {row['project']} | Accessed: {access}x")
+        print(f"   {row['content'][:200]}...")
+        print()
+
+
+def cmd_stats(args):
+    """Show memory statistics."""
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # Total
+    cursor.execute("SELECT COUNT(*) as total FROM memories")
+    total = cursor.fetchone()["total"]
+
+    # By type
+    cursor.execute("SELECT type, COUNT(*) as count FROM memories GROUP BY type ORDER BY count DESC")
+    by_type = cursor.fetchall()
+
+    # By scope
+    cursor.execute("SELECT scope, COUNT(*) as count FROM memories GROUP BY scope ORDER BY count DESC")
+    by_scope = cursor.fetchall()
+
+    # By project
+    cursor.execute("SELECT project, COUNT(*) as count FROM memories GROUP BY project ORDER BY count DESC LIMIT 10")
+    by_project = cursor.fetchall()
+
+    # Most accessed
+    cursor.execute(
+        "SELECT content, type, access_count FROM memories WHERE access_count > 0 ORDER BY access_count DESC LIMIT 5"
+    )
+    most_accessed = cursor.fetchall()
+
+    # Recent
+    cutoff = (datetime.now() - timedelta(days=7)).isoformat()
+    cursor.execute("SELECT COUNT(*) as count FROM memories WHERE timestamp > ?", (cutoff,))
+    recent = cursor.fetchone()["count"]
+
+    conn.close()
+
+    print(f"\n{'='*60}")
+    print("Memory System Statistics")
+    print(f"{'='*60}\n")
+
+    print(f"Total Memories: {total}")
+    print(f"Recent (7 days): {recent}")
+    print(f"Database: {MEMORY_DB}\n")
+
+    print("By Type:")
+    for row in by_type:
+        print(f"  {row['type']}: {row['count']}")
+
+    print("\nBy Scope:")
+    for row in by_scope:
+        scope = row["scope"] or "project"
+        print(f"  {scope}: {row['count']}")
+
+    print("\nTop Projects:")
+    for row in by_project:
+        print(f"  {row['project']}: {row['count']}")
+
+    if most_accessed:
+        print("\nMost Accessed:")
+        for row in most_accessed:
+            print(f"  [{row['type']}] {row['content'][:50]}... ({row['access_count']}x)")
+
+
+def cmd_recent(args):
+    """Show recent memories."""
+    conn = get_db()
+    cursor = conn.cursor()
+
+    days = args.days
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+
+    cursor.execute("""
+        SELECT id, content, type, timestamp, project, scope
+        FROM memories
+        WHERE timestamp > ?
+        ORDER BY timestamp DESC
+        LIMIT 50
+    """, (cutoff,))
+
+    results = cursor.fetchall()
+    conn.close()
+
+    if not results:
+        print(f"No memories in the last {days} days")
+        return
+
+    print(f"\n{'='*60}")
+    print(f"Recent Memories (Last {days} Days): {len(results)} found")
+    print(f"{'='*60}\n")
+
+    for row in results:
+        scope = row["scope"] or "project"
+        ts = row["timestamp"][:16].replace("T", " ")
+        print(f"[{ts}] [{row['type']}] {scope}")
+        print(f"  {row['content'][:150]}...")
+        print()
+
+
+def cmd_consolidate(args):
+    """Find and remove duplicate memories."""
+    print("Finding duplicates... (this may take a while)")
+
+    async def run_consolidation():
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            # Get collection ID first
+            try:
+                response = await client.get(CHROMA_API_BASE)
+                collections = response.json()
+                collection_id = None
+                for coll in collections:
+                    if coll.get("name") == COLLECTION_NAME:
+                        collection_id = coll["id"]
+                        break
+                if not collection_id:
+                    print("ChromaDB collection not found. Run sync_memories first.")
+                    return
+            except Exception as e:
+                print(f"Error connecting to ChromaDB: {e}")
+                print("Make sure ChromaDB is running: docker compose up -d")
+                return
+
+            # Get all memories from ChromaDB
+            try:
+                response = await client.post(
+                    f"{CHROMA_API_BASE}/{collection_id}/get",
+                    json={"include": ["embeddings", "metadatas"]},
+                )
+                data = response.json()
+            except Exception as e:
+                print(f"Error fetching from ChromaDB: {e}")
+                return
+
+            ids = data.get("ids", [])
+            embeddings = data.get("embeddings", [])
+            metadatas = data.get("metadatas", [])
+
+            if not embeddings:
+                print("No embeddings found in ChromaDB. Run sync_memories first.")
+                return
+
+            import numpy as np
+
+            threshold = args.threshold
+            embeddings_array = np.array(embeddings)
+            duplicates = []
+
+            print(f"Comparing {len(ids)} memories with threshold {threshold}...")
+
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    emb_i = embeddings_array[i]
+                    emb_j = embeddings_array[j]
+                    similarity = np.dot(emb_i, emb_j) / (
+                        np.linalg.norm(emb_i) * np.linalg.norm(emb_j)
+                    )
+
+                    if similarity >= threshold:
+                        duplicates.append({
+                            "id_1": ids[i],
+                            "id_2": ids[j],
+                            "content_1": metadatas[i].get("content", "")[:80],
+                            "content_2": metadatas[j].get("content", "")[:80],
+                            "similarity": round(float(similarity), 3),
+                        })
+
+            if not duplicates:
+                print("No duplicates found!")
+                return
+
+            print(f"\nFound {len(duplicates)} duplicate pairs:\n")
+            for i, dup in enumerate(duplicates[:10], 1):
+                print(f"{i}. Similarity: {dup['similarity']}")
+                print(f"   A: {dup['content_1']}...")
+                print(f"   B: {dup['content_2']}...")
+                print()
+
+            if len(duplicates) > 10:
+                print(f"... and {len(duplicates) - 10} more")
+
+            if args.apply:
+                print("\nRemoving duplicates...")
+                conn = get_db()
+                cursor = conn.cursor()
+                deleted = 0
+
+                to_delete = set()
+                for dup in duplicates:
+                    cursor.execute(
+                        "SELECT id, access_count, timestamp FROM memories WHERE id IN (?, ?)",
+                        (dup["id_1"], dup["id_2"]),
+                    )
+                    rows = {r["id"]: r for r in cursor.fetchall()}
+
+                    if dup["id_1"] in rows and dup["id_2"] in rows:
+                        r1, r2 = rows[dup["id_1"]], rows[dup["id_2"]]
+                        if (r1["access_count"] or 0) >= (r2["access_count"] or 0):
+                            to_delete.add(dup["id_2"])
+                        else:
+                            to_delete.add(dup["id_1"])
+
+                for mem_id in to_delete:
+                    cursor.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
+                    try:
+                        await client.post(
+                            f"{CHROMA_API_BASE}/{collection_id}/delete",
+                            json={"ids": [mem_id]},
+                        )
+                    except Exception:
+                        pass
+                    deleted += 1
+
+                conn.commit()
+                conn.close()
+                print(f"Deleted {deleted} duplicate memories")
+            else:
+                print("\nRun with --apply to remove duplicates")
+
+    asyncio.run(run_consolidation())
+
+
+def cmd_prune(args):
+    """Remove old, low-access memories."""
+    conn = get_db()
+    cursor = conn.cursor()
+
+    days = args.days
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+
+    cursor.execute("""
+        SELECT id, content, type, timestamp, access_count
+        FROM memories
+        WHERE timestamp < ? AND (access_count IS NULL OR access_count = 0)
+        ORDER BY timestamp ASC
+    """, (cutoff,))
+
+    candidates = cursor.fetchall()
+
+    if not candidates:
+        print(f"No pruning candidates (memories older than {days} days with 0 access)")
+        conn.close()
+        return
+
+    print(f"\nFound {len(candidates)} pruning candidates:\n")
+    for row in candidates[:10]:
+        ts = row["timestamp"][:10]
+        print(f"  [{ts}] [{row['type']}] {row['content'][:60]}...")
+
+    if len(candidates) > 10:
+        print(f"  ... and {len(candidates) - 10} more")
+
+    if args.apply:
+        confirm = input(f"\nDelete {len(candidates)} memories? [y/N] ")
+        if confirm.lower() == "y":
+            for row in candidates:
+                cursor.execute("DELETE FROM memories WHERE id = ?", (row["id"],))
+            conn.commit()
+            print(f"Deleted {len(candidates)} memories")
+        else:
+            print("Cancelled")
+    else:
+        print(f"\nRun with --apply to delete these {len(candidates)} memories")
+
+    conn.close()
+
+
+def cmd_scope_fix(args):
+    """Auto-detect and fix scope for existing memories."""
+    conn = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, content, scope
+        FROM memories
+        WHERE scope IS NULL OR scope = 'project'
+    """)
+
+    memories = cursor.fetchall()
+    print(f"Checking {len(memories)} memories for scope auto-detection...")
+
+    updated = 0
+    for row in memories:
+        detected = detect_language(row["content"])
+        if detected != "project" and detected != row["scope"]:
+            if args.apply:
+                cursor.execute(
+                    "UPDATE memories SET scope = ? WHERE id = ?",
+                    (detected, row["id"]),
+                )
+                updated += 1
+            else:
+                print(f"  Would update: {row['content'][:50]}... -> {detected}")
+
+    if args.apply:
+        conn.commit()
+        print(f"Updated scope for {updated} memories")
+    else:
+        print(f"\nWould update {updated} memories. Run with --apply to apply changes.")
+
+    conn.close()
+
+
+def cmd_export(args):
+    """Export memories to JSON."""
+    conn = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, content, type, timestamp, context, project, scope, access_count
+        FROM memories
+        ORDER BY timestamp DESC
+    """)
+
+    memories = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    output = args.file or f"memories-export-{datetime.now().strftime('%Y%m%d')}.json"
+
+    with open(output, "w") as f:
+        json.dump(memories, f, indent=2)
+
+    print(f"Exported {len(memories)} memories to {output}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Claude Memory CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Command")
+
+    # search
+    p_search = subparsers.add_parser("search", help="Search memories")
+    p_search.add_argument("query", help="Search query")
+    p_search.add_argument("-l", "--limit", type=int, default=20, help="Max results")
+
+    # stats
+    subparsers.add_parser("stats", help="Show statistics")
+
+    # recent
+    p_recent = subparsers.add_parser("recent", help="Show recent memories")
+    p_recent.add_argument("days", type=int, nargs="?", default=7, help="Days to look back")
+
+    # consolidate
+    p_consolidate = subparsers.add_parser("consolidate", help="Find and remove duplicates")
+    p_consolidate.add_argument("--apply", action="store_true", help="Actually delete duplicates")
+    p_consolidate.add_argument("--threshold", type=float, default=0.85, help="Similarity threshold")
+
+    # prune
+    p_prune = subparsers.add_parser("prune", help="Remove old low-access memories")
+    p_prune.add_argument("--days", type=int, default=90, help="Older than N days")
+    p_prune.add_argument("--apply", action="store_true", help="Actually delete")
+
+    # scope-fix
+    p_scope = subparsers.add_parser("scope-fix", help="Auto-detect and fix scope")
+    p_scope.add_argument("--apply", action="store_true", help="Apply changes")
+
+    # export
+    p_export = subparsers.add_parser("export", help="Export memories to JSON")
+    p_export.add_argument("file", nargs="?", help="Output file")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return
+
+    commands = {
+        "search": cmd_search,
+        "stats": cmd_stats,
+        "recent": cmd_recent,
+        "consolidate": cmd_consolidate,
+        "prune": cmd_prune,
+        "scope-fix": cmd_scope_fix,
+        "export": cmd_export,
+    }
+
+    commands[args.command](args)
+
+
+if __name__ == "__main__":
+    main()

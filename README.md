@@ -15,18 +15,27 @@ You end up re-explaining context, or worse, Claude suggests things you've alread
 
 ## The Solution
 
-This system gives Claude persistent memory across sessions. It has two parts:
+This system gives Claude persistent memory across sessions. It has three parts:
 
-1. **MCP Server** - Tools for Claude to search/store memories manually
+1. **MCP Server** - Tools for Claude to search/store memories with scope awareness
 2. **Auto-learning** - Automatically extracts insights from conversations using Ollama
+3. **CLI Tool** - `mem` command for managing and querying memories
 
 ### What Gets Remembered
 
-- Architectural decisions
+- Architectural decisions (project-specific or global)
 - Code conventions
 - Tech stack choices
-- Gotchas and edge cases
+- Language-specific gotchas (Python, JavaScript, Go, Rust, SQL)
 - Solutions that worked
+
+### Key Features
+
+- **Scope-aware memories** - Project-specific, global, or language-specific (e.g., `language:python`)
+- **BM25 hybrid search** - Combines semantic similarity with keyword matching
+- **Access count tracking** - Frequently accessed memories rank higher
+- **Duplicate detection** - Find and consolidate similar memories
+- **Session state recovery** - Preserves context across compaction
 
 ### How It Works
 
@@ -53,7 +62,8 @@ Claude (with memory):
 │  │ search_memory│    │              │    │              │  │
 │  │ add_learning │    │ Extracts     │    │ Preserves    │  │
 │  │ get_recent   │    │ insights     │    │ context on   │  │
-│  │ memory_stats │    │ automatically│    │ compaction   │  │
+│  │ consolidate  │    │ w/ scope     │    │ compaction   │  │
+│  │ memory_stats │    │ awareness    │    │              │  │
 │  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘  │
 │         │                   │                   │           │
 │         └───────────────────┴───────────────────┘           │
@@ -62,8 +72,8 @@ Claude (with memory):
 │                    │   SQLite DB     │                      │
 │                    │  (~/.claude-    │                      │
 │                    │   memory/data)  │                      │
-│                    └─────────────────┘                      │
-│                                                              │
+│                    └────────┬────────┘                      │
+│                             │                                │
 │  Optional: ChromaDB + Embeddings for semantic search        │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -79,7 +89,7 @@ pip install mcp httpx
 Clone this repo to `~/.claude-memory` (or anywhere):
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/claude-memory.git ~/.claude-memory
+git clone https://github.com/bryancherubemail/claude-memory-oss.git ~/.claude-memory
 ```
 
 Add to Claude Code config (`~/.claude/settings.json`):
@@ -175,9 +185,55 @@ docker compose up -d
 This starts:
 
 - **ChromaDB** on port 8000
-- **HuggingFace embeddings** on port 8080
+- **Ollama** for embeddings (using `nomic-embed-text`)
 
 The MCP server auto-detects these and uses them if available.
+
+## CLI Tool (`mem`)
+
+The `mem` command provides direct access to your memories:
+
+```bash
+# Add to PATH
+export PATH="$PATH:~/.claude-memory/scripts"
+
+# Or run directly
+~/.claude-memory/scripts/mem stats
+```
+
+### Available Commands
+
+| Command              | Purpose                           |
+| -------------------- | --------------------------------- |
+| `mem search <query>` | Search memories by keyword        |
+| `mem stats`          | Show memory statistics            |
+| `mem recent [days]`  | Show memories from last N days    |
+| `mem consolidate`    | Find duplicate memories           |
+| `mem prune --days N` | Remove old, unused memories       |
+| `mem scope-fix`      | Auto-detect and fix memory scopes |
+| `mem export [file]`  | Export all memories to JSON       |
+
+### Examples
+
+```bash
+# Search for authentication-related memories
+mem search authentication
+
+# See what's stored
+mem stats
+
+# Find duplicates (preview)
+mem consolidate
+
+# Actually remove duplicates
+mem consolidate --apply
+
+# Clean up old unused memories (older than 90 days with 0 access)
+mem prune --days 90 --apply
+
+# Fix scope for existing memories
+mem scope-fix --apply
+```
 
 ## How Auto-learning Works
 
@@ -193,32 +249,52 @@ The system hooks into Claude Code's lifecycle:
 
 1. Reads Claude's conversation logs (`~/.claude/projects/`)
 2. Sends to Ollama with extraction prompt
-3. Parses structured output (DECISION, CONVENTION, GOTCHA, etc.)
-4. Stores in SQLite with project tag
+3. Parses structured output with scope (DECISION|SCOPE|CONFIDENCE|content)
+4. Stores in SQLite with project and scope tags
 
 ### What Gets Extracted
 
-The LLM looks for high-value learnings:
+The LLM looks for high-value learnings with scope awareness:
 
 ```
-DECISION: Using PostgreSQL for better JSON support
-CONVENTION: All API endpoints validate input before processing
-GOTCHA: GORM .Find() without .Limit() causes memory issues
-SOLUTION: Fixed CORS by adding credentials header
+DECISION|PROJECT|HIGH|Using PostgreSQL for better JSON support
+CONVENTION|PROJECT|MEDIUM|All API endpoints validate input before processing
+GOTCHA|PYTHON|HIGH|asyncio.gather() silently swallows exceptions without return_exceptions=True
+SOLUTION|GLOBAL|HIGH|Fixed CORS by ensuring OPTIONS returns 204, not 200 with body
+GOTCHA|GO|HIGH|GORM .Find() without .Limit() loads entire table into memory
 ```
 
-Generic advice and obvious facts are filtered out.
+Generic advice and obvious facts are filtered out. LOW confidence items are skipped.
 
 ## MCP Tools Reference
 
-| Tool                   | Purpose                                     |
-| ---------------------- | ------------------------------------------- |
-| `search_memory`        | Semantic search for relevant context        |
-| `add_learning`         | Manually store a decision/convention/gotcha |
-| `get_recent_learnings` | Get memories from last N days               |
-| `memory_stats`         | Check what's stored                         |
-| `sync_memories`        | Sync SQLite to ChromaDB                     |
-| `wm_get_session`       | Get session context (for recovery)          |
+| Tool                   | Purpose                              |
+| ---------------------- | ------------------------------------ |
+| `search_memory`        | Semantic search with scope awareness |
+| `add_learning`         | Store a decision/convention/gotcha   |
+| `get_recent_learnings` | Get memories from last N days        |
+| `consolidate_memories` | Find and remove duplicate memories   |
+| `memory_stats`         | Check what's stored (by type, scope) |
+| `sync_memories`        | Sync SQLite to ChromaDB              |
+| `wm_get_session`       | Get session context (for recovery)   |
+
+## Scope Awareness
+
+Memories are tagged with scope:
+
+| Scope             | Description           | Example                                    |
+| ----------------- | --------------------- | ------------------------------------------ |
+| `project`         | Current project only  | "Using Supabase for auth in this project"  |
+| `global`          | Applies everywhere    | "Always validate user input at boundaries" |
+| `language:python` | Python-specific       | "asyncio.gather needs return_exceptions"   |
+| `language:go`     | Go-specific           | "GORM Find without Limit causes OOM"       |
+| `language:sql`    | Database/SQL-specific | "PostgreSQL uses $1, MySQL uses ?"         |
+
+When searching:
+
+- Current project memories get priority boost (+0.25)
+- Global memories are always included (+0.1)
+- Language-specific memories match when the query relates to that language (+0.15)
 
 ## Project Awareness
 
@@ -226,6 +302,7 @@ Memories are tagged by git repository. When working in a project:
 
 - You see that project's memories
 - Plus global memories
+- Plus language-specific memories for detected languages
 - Other projects stay separate
 
 This prevents "use PostgreSQL" in Project A from confusing Claude in Project B.
@@ -234,13 +311,13 @@ This prevents "use PostgreSQL" in Project A from confusing Claude in Project B.
 
 Environment variables:
 
-| Variable              | Default                 | Purpose                    |
-| --------------------- | ----------------------- | -------------------------- |
-| `CLAUDE_MEMORY_DIR`   | `~/.claude-memory`      | Data directory             |
-| `OLLAMA_MODEL`        | `gemma3:4b`             | Model for extraction       |
-| `EXTRACTION_MAX_TIME` | `120`                   | Max seconds per extraction |
-| `CHROMA_URL`          | `http://localhost:8000` | ChromaDB URL               |
-| `EMBEDDINGS_URL`      | `http://localhost:8080` | Embeddings service         |
+| Variable            | Default                   | Purpose              |
+| ------------------- | ------------------------- | -------------------- |
+| `CLAUDE_MEMORY_DIR` | `~/.claude-memory`        | Data directory       |
+| `OLLAMA_MODEL`      | `gemma3:4b`               | Model for extraction |
+| `OLLAMA_URL`        | `http://localhost:11434`  | Ollama API URL       |
+| `EMBEDDING_MODEL`   | `nomic-embed-text:latest` | Model for embeddings |
+| `CHROMA_URL`        | `http://localhost:8000`   | ChromaDB URL         |
 
 ## Data Storage
 
@@ -252,10 +329,14 @@ All data stays local:
 │   └── memory.db          # SQLite database
 ├── sessions/
 │   └── {project}.md       # Session state files
-├── logs/
-│   └── extraction.log     # Auto-learn logs
-└── locks/
-    └── extraction.lock    # Prevents parallel runs
+├── scripts/
+│   ├── mem                # CLI tool
+│   ├── async-extract      # Background extraction
+│   └── inject-session-state
+└── src/
+    └── claude_memory/
+        ├── server.py      # MCP server
+        └── auto_learn.py  # Extraction logic
 ```
 
 Nothing leaves your machine. No telemetry, no cloud.
