@@ -115,8 +115,8 @@ Install Ollama and pull a model:
 # Install Ollama (https://ollama.ai)
 curl -fsSL https://ollama.ai/install.sh | sh
 
-# Pull a model (gemma3:4b is fast, gemma3:12b is better)
-ollama pull gemma3:4b
+# Pull extraction model (mistral-nemo recommended - 29% better extraction)
+ollama pull mistral-nemo
 ```
 
 Make scripts executable:
@@ -314,7 +314,7 @@ Environment variables:
 | Variable            | Default                   | Purpose              |
 | ------------------- | ------------------------- | -------------------- |
 | `CLAUDE_MEMORY_DIR` | `~/.claude-memory`        | Data directory       |
-| `OLLAMA_MODEL`      | `gemma3:4b`               | Model for extraction |
+| `OLLAMA_MODEL`      | `mistral-nemo`            | Model for extraction |
 | `OLLAMA_URL`        | `http://localhost:11434`  | Ollama API URL       |
 | `EMBEDDING_MODEL`   | `nomic-embed-text:latest` | Model for embeddings |
 | `CHROMA_URL`        | `http://localhost:8000`   | ChromaDB URL         |
