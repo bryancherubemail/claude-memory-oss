@@ -1,5 +1,5 @@
 #!/bin/bash
-# Async wrapper for auto_learn.py
+# Async wrapper for pre_compact hook
 # Runs extraction in background so hooks complete quickly
 
 SCRIPT_DIR="$(dirname "$(realpath "$0")")/.."
@@ -26,7 +26,7 @@ fi
     trap "rm -f '$LOCK_FILE'" EXIT
 
     echo "=== $(date) ===" >> "$LOG_FILE"
-    python3 "$SCRIPT_DIR/src/claude_memory/auto_learn.py" --max-time "$MAX_TIME" "$@" >> "$LOG_FILE" 2>&1
+    python3 "$SCRIPT_DIR/src/claude_memory/server/hooks/pre_compact.py" >> "$LOG_FILE" 2>&1
 ) &
 
 disown

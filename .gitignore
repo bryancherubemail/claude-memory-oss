@@ -1,7 +1,16 @@
 # Data (user's memories are private)
 data/
+db/
 sessions/
+logs/
+locks/
 *.db
+
+# Credentials (never commit)
+credentials.json
+token.json
+.env
+.env.*
 
 # Python
 __pycache__/
@@ -26,7 +35,6 @@ wheels/
 *.egg
 
 # Virtual environments
-.env
 .venv
 env/
 venv/
@@ -44,4 +52,3 @@ Thumbs.db
 
 # Logs
 *.log
-logs/

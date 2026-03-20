@@ -6,9 +6,22 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude-memory/scripts/async-extract --incremental",
+            "command": "python3 ~/.claude-memory/src/claude_memory/server/hooks/pre_compact.py",
+            "timeout": 30,
+            "statusMessage": "Extracting memories..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude-memory/src/claude_memory/server/hooks/memory_prefetch.py",
             "timeout": 5,
-            "statusMessage": "Extracting learnings..."
+            "statusMessage": "Loading context..."
           }
         ]
       }
@@ -22,19 +35,6 @@
             "command": "python3 ~/.claude-memory/src/claude_memory/auto_learn.py --final",
             "timeout": 30,
             "statusMessage": "Final extraction..."
-          }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "matcher": "compact",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.claude-memory/scripts/inject-session-state",
-            "timeout": 5,
-            "statusMessage": "Restoring context..."
           }
         ]
       }
