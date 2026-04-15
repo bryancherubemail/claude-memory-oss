@@ -1,329 +1,183 @@
 # claude-memory
 
-Local long-term memory for Claude Code via MCP. No cloud, no containers, no rent.
+**Claude Code forgets everything between sessions. This fixes that.**
 
-## The Problem
-
-Every time you start a new Claude Code session, Claude starts fresh. It doesn't remember:
-
-- Decisions you made yesterday ("we're using PostgreSQL, not MySQL")
-- Conventions you established ("always use camelCase in this project")
-- Gotchas you discovered ("the auth middleware must come before the rate limiter")
-- Solutions that worked ("fixed the CORS issue by adding the credentials header")
-
-You end up re-explaining context, or worse, Claude suggests things you've already tried and rejected.
-
-## The Solution
-
-This system gives Claude persistent memory across sessions using a single SQLite database with hybrid search. No Docker containers, no cloud services, no API keys required.
-
-### What's New in v2
-
-v2 is a complete rewrite of the memory system:
-
-| Feature         | v1                         | v2                                   |
-| --------------- | -------------------------- | ------------------------------------ |
-| Storage         | SQLite + optional ChromaDB | SQLite + FTS5 + sqlite-vec (unified) |
-| Search          | Text or ChromaDB semantic  | Hybrid BM25 + vector with RRF fusion |
-| Retrieval       | Flat                       | Tiered (hot cache -> FTS -> hybrid)  |
-| Deduplication   | Embedding similarity       | Hash + semantic similarity           |
-| Extraction      | Single model               | Primary + fallback model             |
-| Knowledge graph | None                       | Memory relations with traversal      |
-| Threads         | None                       | Open/resolved thread tracking        |
-| Importance      | Static                     | Decay over time, access-boosted      |
-| Containers      | ChromaDB + TEI Docker      | None needed                          |
-
-### Key Features
-
-- **Hybrid search** - BM25 keyword + vector semantic search with Reciprocal Rank Fusion (RRF)
-- **Smart alpha** - Auto-tunes keyword vs semantic weighting based on query type
-- **Tiered retrieval** - Hot cache (0ms) -> FTS5 (10ms) -> hybrid (50ms), stops early
-- **Knowledge graph** - Memory relations, contradiction detection, graph traversal
-- **Thread tracking** - Open items persist across sessions, mark resolved when done
-- **Importance decay** - Unused memories fade, frequently accessed ones stay prominent
-- **Deduplication** - Hash + semantic similarity prevents duplicate storage
-- **Session recovery** - Preserves context across compaction events
-- **Fully local** - All processing via Ollama, data stays on your machine
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     Claude Code                             │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │  MCP Server  │    │   Hooks      │    │  Extraction  │  │
-│  │  (13 tools)  │    │              │    │   (Ollama)   │  │
-│  │              │    │ PreCompact   │    │              │  │
-│  │ search       │    │ UserPrompt   │    │ gemma3:27b   │  │
-│  │ add_memory   │    │ SessionEnd   │    │ (primary)    │  │
-│  │ recall       │    │              │    │              │  │
-│  │ threads      │    │ Prefetch +   │    │ gemma3:4b    │  │
-│  │ relations    │    │ Extract      │    │ (fallback)   │  │
-│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘  │
-│         │                   │                   │           │
-│         └───────────────────┼───────────────────┘           │
-│                             │                               │
-│  ┌──────────────────────────▼──────────────────────────┐    │
-│  │              Tiered Retrieval                       │    │
-│  │  Tier 0: Hot Cache (LRU, <1ms, 0 tokens)          │    │
-│  │  Tier 1: FTS5 BM25 (SQLite, <10ms, ~100 tokens)   │    │
-│  │  Tier 2: Hybrid RRF (BM25+vec, <50ms, ~300 tokens)│    │
-│  └──────────────────────────┬──────────────────────────┘    │
-│                             │                               │
-│  ┌──────────────────────────▼──────────────────────────┐    │
-│  │         SQLite (single file, WAL mode)              │    │
-│  │  memories + FTS5 index + sqlite-vec embeddings      │    │
-│  │  memory_relations (knowledge graph)                 │    │
-│  │  sessions + projects                                │    │
-│  └─────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
-```
+Local-first persistent memory for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) via [MCP](https://modelcontextprotocol.io/). Hybrid BM25 + vector search. Knowledge graph. Importance decay. Zero cloud dependencies. All data stays on your machine.
 
 ## Quick Start
 
-### 1. Prerequisites
+### 1. Install Ollama models
 
 ```bash
-# Install Ollama (https://ollama.ai)
-curl -fsSL https://ollama.ai/install.sh | sh
-
-# Pull required models
-ollama pull nomic-embed-text    # embeddings (768 dims)
-ollama pull gemma3:27b          # extraction (or gemma3:latest for smaller GPUs)
+ollama pull nomic-embed-text    # embeddings (required)
+ollama pull gemma3               # extraction (optional, for auto-learning)
 ```
 
-### 2. Install
+### 2. Install claude-memory
 
 ```bash
-# Clone
-git clone https://github.com/bryancherubemail/claude-memory-oss.git ~/.claude-memory
-cd ~/.claude-memory
-
-# Install dependencies
-pip install mcp httpx sqlite-vec
+pip install git+https://github.com/bryancherubemail/claude-memory-oss.git
 ```
 
-### 3. Configure Claude Code
+### 3. Add to Claude Code
 
-Add to your project's `.mcp.json` or `~/.claude/settings.json`:
+Add this to your Claude Code MCP settings (`~/.claude.json` or project `.claude.json`):
 
 ```json
 {
   "mcpServers": {
-    "claude-memory-v2": {
-      "command": "python3",
-      "args": ["-m", "claude_memory.server"],
-      "cwd": "~/.claude-memory/src"
+    "claude-memory": {
+      "command": "claude-memory",
+      "env": {}
     }
   }
 }
 ```
 
-Restart Claude Code. Memory tools are now available.
+That's it. Claude Code now has persistent memory across sessions.
 
-### 4. Enable Hooks (Recommended)
+## What It Does
 
-Hooks automate memory extraction and context injection. Add to `~/.claude/settings.json`:
+- **Remembers across sessions** — decisions, facts, conventions, gotchas, preferences survive compaction and restarts
+- **Hybrid search** — BM25 keyword matching + semantic vector search, auto-tuned per query via [Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf)
+- **Knowledge graph** — related memories are linked automatically; contradictions are detected
+- **Importance decay** — unused memories fade over time, keeping results relevant
+- **Auto-extraction** — hooks extract learnings from conversations before compaction
+- **Thread tracking** — ongoing work items persist and can be resolved
+- **Fully local** — SQLite on your machine, Ollama for embeddings. No API keys, no cloud, no subscriptions
 
-```json
-{
-  "hooks": {
-    "PreCompact": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ~/.claude-memory/src/claude_memory/server/hooks/pre_compact.py",
-            "timeout": 30,
-            "statusMessage": "Extracting memories..."
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ~/.claude-memory/src/claude_memory/server/hooks/memory_prefetch.py",
-            "timeout": 5,
-            "statusMessage": "Loading context..."
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+## Tools
 
-See `hooks-example.json` for the full example including SessionEnd.
+| Tool                  | Description                                                                   |
+| --------------------- | ----------------------------------------------------------------------------- |
+| `search_memory`       | Hybrid BM25 + vector search across all memories                               |
+| `recall_context`      | Get relevant context for current session (use at startup or after compaction) |
+| `add_memory`          | Store a new memory with category, tags, and importance                        |
+| `extract`             | Extract insights from a conversation exchange                                 |
+| `get_session`         | Get current session state for recovery                                        |
+| `save_session`        | Save session state before compaction                                          |
+| `get_threads`         | List open threads (unresolved work items)                                     |
+| `resolve_thread`      | Mark a thread as resolved                                                     |
+| `get_relations`       | Traverse the knowledge graph from a memory                                    |
+| `find_contradictions` | Find memories that may contradict each other                                  |
+| `memory_stats`        | Get memory system statistics                                                  |
+| `decay_old`           | Run importance decay on old unused memories                                   |
+| `update_memory`       | Update an existing memory's importance                                        |
 
-## MCP Tools Reference
+## Hooks (Optional)
 
-| Tool                  | Purpose                                                           |
-| --------------------- | ----------------------------------------------------------------- |
-| `search_memory`       | Hybrid BM25 + vector search with smart alpha tuning               |
-| `recall_context`      | Tiered context retrieval (hot cache -> FTS -> hybrid)             |
-| `add_memory`          | Store a decision, fact, preference, gotcha, convention, or thread |
-| `extract`             | Extract insights from a conversation exchange via Ollama          |
-| `get_session`         | Get session state for recovery after compaction                   |
-| `save_session`        | Save session state before compaction                              |
-| `get_threads`         | List open/unresolved threads for a project                        |
-| `resolve_thread`      | Mark a thread as resolved                                         |
-| `get_relations`       | Traverse the memory knowledge graph                               |
-| `find_contradictions` | Find memories that contradict each other                          |
-| `memory_stats`        | System statistics (counts, categories, namespaces)                |
-| `decay_old`           | Run importance decay on old unused memories                       |
-| `update_memory`       | Update a memory's importance score                                |
+Hooks let Claude Code automatically extract memories from conversations. Copy `hooks-example.json` to your Claude Code hooks config:
 
-## How It Works
-
-### Hybrid Search with Smart Alpha
-
-Every search query runs through two signals fused with Reciprocal Rank Fusion:
-
-1. **BM25 (FTS5)** - Keyword matching with Porter stemming
-2. **Vector (sqlite-vec)** - Semantic similarity via nomic-embed-text embeddings
-
-The system auto-tunes the balance (`alpha`) based on query characteristics:
-
-- Technical queries (camelCase, snake_case, error messages) -> more BM25 (exact matching)
-- Conceptual queries ("how to", "best practice", "why") -> more vector (semantic)
-- Alpha range: 0.2 (mostly keyword) to 0.8 (mostly semantic)
-
-### Tiered Retrieval
-
-Context recall uses progressive loading to minimize latency and token usage:
-
-| Tier | Source                     | Latency | Token Cost |
-| ---- | -------------------------- | ------- | ---------- |
-| 0    | Hot cache (LRU, in-memory) | <1ms    | 0          |
-| 1    | FTS5 BM25 (SQLite)         | <10ms   | ~100       |
-| 2    | Hybrid RRF (BM25 + vector) | <50ms   | ~300       |
-
-Stops early when enough results are found or the token budget is exceeded.
-
-### Auto-Extraction
-
-The PreCompact hook reads Claude's conversation transcript and uses a local Ollama model to extract structured insights:
-
-- **DECISION** - Choices made with rationale
-- **FACT** - Technical details established
-- **PREFERENCE** - User prefers X over Y
-- **GOTCHA** - Things that break unexpectedly
-- **CONVENTION** - Rules or patterns to follow
-- **THREAD** - Open/unresolved items
-
-Each extracted insight is deduplicated (hash + semantic similarity) before storage. Related memories are automatically linked in the knowledge graph.
-
-### Importance Decay
-
-Memories that haven't been accessed in 7+ days get their importance reduced by 5% per week. Memories that decay to importance=1 and are older than 30 days get archived. Frequently accessed memories maintain their importance naturally.
-
-## Migrating from v1
-
-If you have an existing v1 database (`~/.claude-memory/data/memory.db`), run the migration script:
-
-```bash
-# Preview what will be migrated
-python3 migrate_v1_to_v2.py --dry-run
-
-# Run migration (re-embeds all memories with nomic-embed-text)
-python3 migrate_v1_to_v2.py
-```
-
-The migration:
-
-- Maps v1 types to v2 categories
-- Re-embeds all memories with nomic-embed-text (768 dims)
-- Deduplicates by content hash
-- Preserves timestamps and project associations
-
-v1 data is not modified - the migration creates a new v2 database.
+| Hook               | When                      | What it does                                             |
+| ------------------ | ------------------------- | -------------------------------------------------------- |
+| `PreCompact`       | Before context compaction | Extracts decisions, facts, gotchas from the conversation |
+| `UserPromptSubmit` | On each user message      | Prefetches relevant context into hot cache               |
+| `SessionEnd`       | When session ends         | Final extraction pass                                    |
 
 ## Configuration
 
-Environment variables:
+All settings are in `src/claude_memory/server/config.py` and can be overridden via environment variables:
 
-| Variable                    | Default                   | Purpose                   |
-| --------------------------- | ------------------------- | ------------------------- |
-| `CLAUDE_MEMORY_DIR`         | `~/.claude-memory`        | Data directory            |
-| `OLLAMA_URL`                | `http://localhost:11434`  | Ollama API URL            |
-| `EMBEDDING_MODEL`           | `nomic-embed-text:latest` | Embedding model           |
-| `EXTRACTION_MODEL`          | `gemma3:27b`              | Primary extraction model  |
-| `EXTRACTION_MODEL_FALLBACK` | `gemma3:latest`           | Fallback extraction model |
+| Variable                    | Default                   | Description                          |
+| --------------------------- | ------------------------- | ------------------------------------ |
+| `CLAUDE_MEMORY_DIR`         | `~/.claude-memory`        | Data storage directory               |
+| `OLLAMA_URL`                | `http://localhost:11434`  | Ollama API endpoint                  |
+| `EMBEDDING_MODEL`           | `nomic-embed-text:latest` | Model for embeddings (768-dim)       |
+| `EXTRACTION_MODEL`          | `gemma3:27b`              | Primary model for insight extraction |
+| `EXTRACTION_MODEL_FALLBACK` | `gemma3:latest`           | Fallback extraction model            |
+
+### Search Tuning
+
+| Parameter              | Default | Description                                |
+| ---------------------- | ------- | ------------------------------------------ |
+| `RRF_K`                | 60      | Reciprocal Rank Fusion constant            |
+| `DEFAULT_ALPHA`        | 0.5     | Balance: 0 = pure BM25, 1 = pure vector    |
+| `SIMILARITY_THRESHOLD` | 0.85    | Deduplication threshold                    |
+| `RELATED_THRESHOLD`    | 0.7     | Auto-linking threshold for knowledge graph |
+
+### Memory Lifecycle
+
+| Parameter          | Default | Description                                        |
+| ------------------ | ------- | -------------------------------------------------- |
+| `DECAY_RATE`       | 0.95    | Importance multiplier per week of inactivity       |
+| `DECAY_FLOOR`      | 1       | Minimum importance before archival eligible        |
+| `ARCHIVE_AGE_DAYS` | 30      | Archive if at floor importance and older than this |
+
+## How It Works
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   Claude Code                        │
+│                                                      │
+│  search_memory("how did we handle auth?")            │
+│         │                                            │
+└─────────┼────────────────────────────────────────────┘
+          │ MCP
+          ▼
+┌─────────────────────────────────────────────────────┐
+│              claude-memory server                    │
+│                                                      │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────────┐   │
+│  │ Hot Cache │→ │  FTS5    │→ │ Hybrid RRF       │   │
+│  │ (Tier 0)  │  │ (Tier 1) │  │ BM25+Vec (Tier 2)│   │
+│  │ <1ms      │  │ ~10ms    │  │ ~50ms            │   │
+│  └──────────┘  └──────────┘  └──────────────────┘   │
+│                                                      │
+│  ┌──────────────────────────────────────────────┐    │
+│  │         SQLite (single file)                  │    │
+│  │  FTS5 virtual table ← BM25 keyword search     │    │
+│  │  sqlite-vec table   ← 768-dim vector search   │    │
+│  │  memory_relations   ← knowledge graph         │    │
+│  │  sessions           ← compaction recovery     │    │
+│  └──────────────────────────────────────────────┘    │
+│                                                      │
+│  Ollama (local)                                      │
+│  ├── nomic-embed-text → embeddings                   │
+│  └── gemma3           → extraction                   │
+└─────────────────────────────────────────────────────┘
+```
+
+**Tiered retrieval** stops early when enough results are found — most queries resolve from the hot cache or FTS5 without touching vectors at all.
+
+**Smart alpha** auto-tunes the BM25/vector balance per query: code identifiers (`camelCase`, `snake_case`) get more BM25 weight; conceptual questions ("how to", "best practice") get more vector weight.
 
 ## Data Storage
-
-All data stays local in a single SQLite file:
 
 ```
 ~/.claude-memory/
 ├── db/
-│   └── memory_v2.db       # Single SQLite file (FTS5 + sqlite-vec)
-├── sessions/               # Session state files
-├── logs/                   # Extraction logs
-├── src/
-│   └── claude_memory/
-│       ├── server/         # v2 MCP server (modular)
-│       │   ├── main.py     # MCP entry point (13 tools)
-│       │   ├── config.py   # Central configuration
-│       │   ├── storage/    # SessionDB, HotCache, TieredRetrieval
-│       │   ├── extraction/ # Ollama-based insight extraction
-│       │   ├── utils/      # Fusion, embeddings, compression, prefetch
-│       │   └── hooks/      # PreCompact, UserPromptSubmit
-│       ├── server.py       # v1 server (kept for compatibility)
-│       └── auto_learn.py   # v1 extraction (standalone)
-├── scripts/
-│   ├── mem                 # CLI tool
-│   ├── async-extract       # Background extraction
-│   └── inject-session-state
-├── migrate_v1_to_v2.py     # v1 -> v2 migration
-└── hooks-example.json      # Hook configuration example
+│   └── memory_v2.db      # All memories, embeddings, relations, sessions
+├── sessions/
+│   └── {project}.md       # Session state files for compaction recovery
+└── logs/
+    └── extraction.log     # Extraction activity log
 ```
 
-Nothing leaves your machine. No telemetry, no cloud, no API keys.
+Everything is in one SQLite file. Back it up, move it, inspect it with any SQLite tool.
 
-## CLI Tool (`mem`)
+## Categories
 
-The `mem` command provides direct access to your v1 memories:
+Memories are categorized for filtering and relevance:
 
-```bash
-# Add to PATH
-export PATH="$PATH:~/.claude-memory/scripts"
+| Category     | Use for                                                     |
+| ------------ | ----------------------------------------------------------- |
+| `decision`   | Architecture choices, technology selections, tradeoffs made |
+| `fact`       | Project details, API specifics, environment info            |
+| `preference` | User preferences, workflow choices                          |
+| `gotcha`     | Bugs, non-obvious issues, workarounds                       |
+| `convention` | File organization, naming patterns, code style              |
+| `thread`     | Ongoing work items, open questions                          |
 
-mem search <query>       # Search memories
-mem stats                # Show statistics
-mem recent [days]        # Recent memories
-mem consolidate [--apply] # Find duplicates
-mem prune --days N       # Remove old memories
-mem export [file]        # Export to JSON
-```
+## Requirements
 
-## Why This Exists
-
-There are paid services that do this (Mem0, Zep, etc). They charge $25+/month for what amounts to SQLite + embeddings + an LLM call.
-
-I built this because:
-
-1. The core functionality is simple
-2. My data should stay on my machine
-3. I shouldn't pay rent for a database
-
-This is that system, shared for anyone who feels the same way.
-
-## Status
-
-This is a personal project shared as-is.
-
-- No support
-- No guarantees
-- No roadmap
-
-Fork it, extend it, make it your own. If it breaks, you get to keep both pieces.
+- Python 3.10+
+- [Ollama](https://ollama.ai/) running locally with `nomic-embed-text` model
+- Claude Code with MCP support
 
 ## License
 
-MIT - do whatever you want with it.
+MIT - see [LICENSE](LICENSE)
+
+---
+
+Built for my own workflow. Shared because others wanted it. Issues and PRs welcome.
